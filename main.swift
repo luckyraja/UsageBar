@@ -1,10 +1,11 @@
 import AppKit
 import ServiceManagement
+import UserNotifications
 
 // Menu bar readout of subscription usage left:  C  5H 77%  W 58%   │   G  5H 93%  W 81%
 // (Claude 5h·week, ChatGPT 5h·week, as % left.)
 // Claude: snapshot written by the Claude Code status line (~/.claude/statusline-command.sh).
-// ChatGPT: `openclaw status --usage --json`, which reads the Codex login Mini uses.
+// ChatGPT: `openclaw models status`, which reads the Codex login Mini uses.
 
 struct Window {
     let usedPercent: Double
@@ -44,10 +45,17 @@ enum Claude {
 enum ChatGPT {
     static let openclaw = NSHomeDirectory() + "/.local/bin/openclaw"
 
+    // `openclaw models status` costs about 2.5x less CPU than `status --usage --json`,
+    // but its text could change in an update, so the JSON is the fallback.
     static func fetch() -> Usage {
+        if let usage = fromText(run(["models", "status"])) { return usage }
+        return fromJSON(run(["status", "--usage", "--json"]))
+    }
+
+    static func run(_ args: [String]) -> Data {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: openclaw)
-        p.arguments = ["status", "--usage", "--json"]
+        p.arguments = args
         // openclaw is a node script; use the same PATH as the OpenClaw gateway.
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/opt/node@24/bin:\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -56,9 +64,43 @@ enum ChatGPT {
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
         p.standardInput = FileHandle.nullDevice
-        do { try p.run() } catch { return Usage(error: "openclaw not found") }
+        do { try p.run() } catch { return Data() }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        return data
+    }
+
+    // "- openai usage: 5h 93% left ⏱1h 45m · Week 99% left ⏱6d 15h"
+    static func fromText(_ data: Data) -> Usage? {
+        let text = String(decoding: data, as: UTF8.self)
+        guard let line = text.split(separator: "\n").first(where: { $0.contains("openai usage:") }) else { return nil }
+        let regex = try! NSRegularExpression(pattern: #"(5h|Week)\s+(\d+)% left\D*?((?:\d+[dhm]\s*)+)"#)
+        var windows: [String: Window] = [:]
+        let s = String(line)
+        for m in regex.matches(in: s, range: NSRange(s.startIndex..., in: s)) {
+            let label = String(s[Range(m.range(at: 1), in: s)!])
+            let left = Double(s[Range(m.range(at: 2), in: s)!]) ?? 0
+            windows[label] = Window(usedPercent: 100 - left,
+                                    resetsAt: Date().addingTimeInterval(seconds(String(s[Range(m.range(at: 3), in: s)!]))))
+        }
+        guard let five = windows["5h"], let week = windows["Week"] else { return nil }
+        return Usage(fiveHour: five, week: week, updated: Date())
+    }
+
+    // "6d 15h" -> seconds
+    static func seconds(_ duration: String) -> TimeInterval {
+        duration.split(separator: " ").reduce(0) { total, part in
+            guard let n = Double(part.dropLast()) else { return total }
+            switch part.last {
+            case "d": return total + n * 86400
+            case "h": return total + n * 3600
+            case "m": return total + n * 60
+            default: return total
+            }
+        }
+    }
+
+    static func fromJSON(_ data: Data) -> Usage {
         guard let json = try? JSONSerialization.jsonObject(with: data),
               let provider = find(json, where: { $0["provider"] as? String == "openai" && $0["windows"] != nil }),
               let windows = provider["windows"] as? [[String: Any]] else {
@@ -82,6 +124,52 @@ enum ChatGPT {
         }
         return nil
     }
+
+    // Same shape as the Claude snapshot, so other tools (Mini) can read usage without running openclaw.
+    static func save(_ u: Usage) {
+        func window(_ w: Window?) -> Any {
+            guard let w else { return NSNull() }
+            return ["used_percentage": w.usedPercent, "resets_at": w.resetsAt.map { Int($0.timeIntervalSince1970) } as Any]
+        }
+        let json: [String: Any] = ["five_hour": window(u.fiveHour), "seven_day": window(u.week),
+                                   "updated": Int((u.updated ?? Date()).timeIntervalSince1970)]
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return }
+        try? FileManager.default.createDirectory(atPath: supportDir, withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: supportDir + "/chatgpt.json"), options: .atomic)
+    }
+}
+
+// Notifies once per window per reset period when usage left drops to 10% or below.
+enum LowUsageAlert {
+    static let threshold = 10
+    static let key = "notifiedWindows"
+
+    static func requestPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    static func check(_ name: String, _ u: Usage) {
+        check(name, "5-hour", u.fiveHour)
+        check(name, "weekly", u.week)
+    }
+
+    static func check(_ name: String, _ label: String, _ w: Window?) {
+        guard let w, let resetsAt = w.resetsAt, resetsAt > Date(), w.leftPercent <= threshold else { return }
+        // Round the reset time so a slightly different estimate doesn't count as a new window.
+        let id = "\(name)|\(label)|\(Int(resetsAt.timeIntervalSince1970 / 3600))"
+        var sent = UserDefaults.standard.stringArray(forKey: key) ?? []
+        guard !sent.contains(id) else { return }
+        sent = Array((sent + [id]).suffix(20))
+        UserDefaults.standard.set(sent, forKey: key)
+
+        let content = UNMutableNotificationContent()
+        content.title = "\(name) \(label) limit: \(w.leftPercent)% left"
+        let f = DateFormatter()
+        f.dateFormat = Calendar.current.isDateInToday(resetsAt) ? "h:mm a" : "EEE h:mm a"
+        content.body = "Resets \(f.string(from: resetsAt))."
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -93,12 +181,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? SMAppService.mainApp.register()  // start at login
+        LowUsageAlert.requestPermission()
         menu.delegate = self
         item.menu = menu
         claude = Claude.read()
         render()
         fetchChatGPT()
-        // Claude's snapshot is a local file, so re-read it often; ChatGPT costs a ~20s openclaw run.
+        // Claude's snapshot is a local file, so re-read it often; ChatGPT costs a ~10s openclaw run.
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.claude = Claude.read()
             self?.render()
@@ -115,6 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.fetching = false
                 // Keep the last good numbers if one fetch fails.
                 if usage.error == nil || self.chatgpt.fiveHour == nil { self.chatgpt = usage }
+                if usage.error == nil { ChatGPT.save(usage) }
                 self.render()
             }
         }
@@ -123,6 +213,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Title
 
     private func render() {
+        LowUsageAlert.check("Claude", claude)
+        LowUsageAlert.check("ChatGPT", chatgpt)
         let title = NSMutableAttributedString()
         func add(_ s: String, _ color: NSColor = .labelColor, bold: Bool = false) {
             let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize - 1, weight: bold ? .semibold : .regular)
